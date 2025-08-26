@@ -1,4 +1,3 @@
-[![github.com/krisograbek/t...](https://images.openai.com/thumbnails/url/V9Ae4Hicu1mSUVJSUGylr5-al1xUWVCSmqJbkpRnoJdeXJJYkpmsl5yfq5-Zm5ieWmxfaAuUsXL0S7F0Tw5xyUnKyQk3DzQKSQ2NsPBOKYiPiMr3qir1qyqKMDJ0Ts4xLjdyyjCwDDAsyq9KqTIxz7JMNazKN8jNKVcrBgAfwyoT)](https://github.com/krisograbek/text-preprocessing/blob/main/PythonTextPreprocessingColab.ipynb)
 
 The GitHub repository **[text\_preprocessing](https://github.com/manikrishna-m/text_preprocessing)** by [manikrishna-m](https://github.com/manikrishna-m) offers a foundational implementation for natural language processing (NLP) tasks. This project serves as an introductory resource for those looking to understand and apply basic text preprocessing techniques in Python.
 
