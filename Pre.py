@@ -1,97 +1,155 @@
 import io
-import fitz  # PyMuPDF
 import cv2
+import fitz
 import numpy as np
-from PIL import Image, ImageEnhance
+from PIL import Image
+from pdf2image import convert_from_bytes
 
-class PDFPreprocessor:
-    def __init__(self, dpi=300, contrast_factor=1.5):
+
+class OCRPreprocessorBytes:
+    def __init__(self, dpi=300):
         self.dpi = dpi
-        self.contrast_factor = contrast_factor
 
-    # --- Step 1: Convert PDF bytes -> Images ---
-    def _pdf_to_images(self, pdf_bytes):
+    # ---------------------------
+    # 1. Detect if PDF is digital-born
+    # ---------------------------
+    def is_digital_pdf(self, pdf_bytes):
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        images = []
+        total_area = 0
+        text_area = 0
         for page in doc:
-            zoom = self.dpi / 72.0  # scale factor
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            images.append(np.array(img))
-        return images
+            total_area += abs(page.rect)
+            blocks = page.get_text("blocks")
+            for b in blocks:
+                rect = fitz.Rect(b[:4])
+                text_area += abs(rect)
+        coverage = text_area / total_area if total_area > 0 else 0
+        return coverage >= 0.01  # True if digital-born
 
-    # --- Step 2: Enhance contrast ---
-    def _adjust_contrast(self, image):
-        pil_img = Image.fromarray(image)
-        enhancer = ImageEnhance.Contrast(pil_img)
-        enhanced = enhancer.enhance(self.contrast_factor)
-        return np.array(enhanced)
+    # ---------------------------
+    # 2. Convert PDF bytes to high-res images
+    # ---------------------------
+    def pdf_bytes_to_images(self, pdf_bytes):
+        pil_images = convert_from_bytes(pdf_bytes, dpi=self.dpi)
+        pil_images = [img.convert('RGB') for img in pil_images]
+        return pil_images
 
-    # --- Step 3: Deskew ---
-    def _deskew(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.bitwise_not(gray)
-        thresh = cv2.threshold(gray, 0, 255,
-                               cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-        coords = np.column_stack(np.where(thresh > 0))
-        if coords.size == 0:
-            return image
+    # ---------------------------
+    # 3. Convert PIL to OpenCV
+    # ---------------------------
+    def pil_to_cv(self, pil_img):
+        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+    # ---------------------------
+    # 4. Grayscale conversion
+    # ---------------------------
+    def to_grayscale(self, img):
+        if len(img.shape) == 3:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return img
+
+    # ---------------------------
+    # 5. Denoising
+    # ---------------------------
+    def denoise(self, gray_img, method='median', **kwargs):
+        if method == 'median':
+            k = kwargs.get('ksize', 3)
+            return cv2.medianBlur(gray_img, k)
+        elif method == 'bilateral':
+            d = kwargs.get('d', 9)
+            sigmaColor = kwargs.get('sigmaColor', 75)
+            sigmaSpace = kwargs.get('sigmaSpace', 75)
+            return cv2.bilateralFilter(gray_img, d, sigmaColor, sigmaSpace)
+        elif method == 'nlmeans':
+            h = kwargs.get('h', 10)
+            return cv2.fastNlMeansDenoising(gray_img, None, h, 7, 21)
+        else:
+            raise ValueError("Unsupported denoise method")
+
+    # ---------------------------
+    # 6. Binarization
+    # ---------------------------
+    def binarize(self, gray_img, method='otsu', block_size=31, C=10):
+        if method == 'otsu':
+            _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        elif method == 'adaptive':
+            binary = cv2.adaptiveThreshold(gray_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                           cv2.THRESH_BINARY, block_size, C)
+        elif method == 'fixed':
+            _, binary = cv2.threshold(gray_img, C, 255, cv2.THRESH_BINARY)
+        else:
+            raise ValueError("Unsupported binarization method")
+        return binary
+
+    # ---------------------------
+    # 7. Contrast enhancement
+    # ---------------------------
+    def enhance_contrast(self, gray_img, method='clahe'):
+        if method == 'clahe':
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            return clahe.apply(gray_img)
+        elif method == 'hist_eq':
+            return cv2.equalizeHist(gray_img)
+        else:
+            return gray_img
+
+    # ---------------------------
+    # 8. Skew correction
+    # ---------------------------
+    def deskew(self, binary_img, orig_img):
+        coords = np.column_stack(np.where(binary_img < 255))
         angle = cv2.minAreaRect(coords)[-1]
         if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
-        (h, w) = image.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(image, M, (w, h),
-                                 flags=cv2.INTER_CUBIC,
+            angle += 90
+        (h, w) = orig_img.shape[:2]
+        M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
+        rotated = cv2.warpAffine(orig_img, M, (w, h), flags=cv2.INTER_CUBIC,
                                  borderMode=cv2.BORDER_REPLICATE)
         return rotated
 
-    # --- Step 4: Remove background ---
-    def _remove_background(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        cleaned = cv2.adaptiveThreshold(gray, 255,
-                                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                        cv2.THRESH_BINARY, 35, 11)
-        return cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
+    # ---------------------------
+    # 9. Full preprocessing pipeline for a single image
+    # ---------------------------
+    def preprocess_image(self, img, denoise_method='median', binarize_method='otsu', enhance_method='clahe', deskew_flag=True):
+        gray = self.to_grayscale(img)
+        denoised = self.denoise(gray, method=denoise_method)
+        enhanced = self.enhance_contrast(denoised, method=enhance_method)
+        binary = self.binarize(enhanced, method=binarize_method)
+        if deskew_flag:
+            final_img = self.deskew(binary, enhanced)
+        else:
+            final_img = enhanced
+        return final_img, binary
 
-    # --- Step 5: Orientation correction (simple heuristic) ---
-    def _correct_rotation(self, image):
-        # Simple text-orientation correction (if needed)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        lines = cv2.HoughLines(edges, 1, np.pi/180, 200)
-        if lines is not None:
-            angles = [line[0][1] for line in lines]
-            avg_angle = np.mean(angles)
-            angle_deg = np.degrees(avg_angle - np.pi/2)
-            (h, w) = image.shape[:2]
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
-            image = cv2.warpAffine(image, M, (w, h),
-                                   flags=cv2.INTER_CUBIC,
-                                   borderMode=cv2.BORDER_REPLICATE)
-        return image
+    # ---------------------------
+    # 10. Main processing entry point
+    # ---------------------------
+    def process_bytes(self, file_bytes, file_type='pdf'):
+        """
+        file_type: 'pdf', 'image' (png, jpeg, jpg, tiff)
+        """
+        preprocessed_images = []
+        digital_text = None
 
-    # --- Step 6: Convert back to PDF bytes ---
-    def _images_to_pdf(self, images):
-        pil_images = [Image.fromarray(img).convert("RGB") for img in images]
-        output = io.BytesIO()
-        pil_images[0].save(output, format="PDF", save_all=True, append_images=pil_images[1:])
-        return output.getvalue()
+        if file_type == 'pdf':
+            if self.is_digital_pdf(file_bytes):
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                digital_text = ""
+                for page in doc:
+                    digital_text += page.get_text()
+                return {'text': digital_text, 'images': None}
+            else:
+                pil_images = self.pdf_bytes_to_images(file_bytes)
+                for pil_img in pil_images:
+                    img = self.pil_to_cv(pil_img)
+                    final_img, binary = self.preprocess_image(img)
+                    preprocessed_images.append(final_img)
+        elif file_type == 'image':
+            img_array = np.frombuffer(file_bytes, np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            final_img, binary = self.preprocess_image(img)
+            preprocessed_images.append(final_img)
+        else:
+            raise ValueError("Unsupported file_type")
 
-    # --- MAIN PIPELINE ---
-    def preprocess_pdf(self, pdf_bytes):
-        pages = self._pdf_to_images(pdf_bytes)
-        processed_pages = []
-        for img in pages:
-            img = self._adjust_contrast(img)
-            img = self._deskew(img)
-            img = self._remove_background(img)
-            img = self._correct_rotation(img)
-            processed_pages.append(img)
-        cleaned_pdf = self._images_to_pdf(processed_pages)
-        return cleaned_pdf, processed_pages
+        return {'text': digital_text, 'images': preprocessed_images}
